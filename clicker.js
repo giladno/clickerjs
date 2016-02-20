@@ -335,10 +335,6 @@ module.exports.server = function(config){
             resolve(server); }).on('error', reject);
     });
 };
-
-module.exports.debug = function(port){
-    return new Debug(port);
-};
 if (!module.parent)
 {
     var argv = require('yargs')
