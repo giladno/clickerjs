@@ -1,0 +1,3 @@
+[submodule "external/w2ui"]
+	path = external/w2ui
+	url = git@github.com:vitmalina/w2ui.git

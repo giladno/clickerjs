@@ -1,0 +1,20 @@
+{
+  "name": "clickerjs",
+  "version": "0.0.1",
+  "authors": [
+    "Gilad Novik <gilad@novik.ca>"
+  ],
+  "moduleType": [
+    "node"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "jsdiff": "^2.2.1",
+    "requirejs": "^2.1.22",
+    "jquery": "^2.2.0",
+    "socket.io-client": "^1.4.5",
+    "font-awesome": "^4.5.0",
+    "codemirror": "^5.11.0",
+    "jquery.terminal": "^0.9.3"
+  }
+}

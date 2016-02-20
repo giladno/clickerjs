@@ -1,0 +1,763 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+    <title>clickerjs</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="w2ui/dist/w2ui.min.css" rel="stylesheet">
+    <link href="font-awesome/css/font-awesome.min.css" rel="stylesheet">
+    <link href="codemirror/lib/codemirror.css" rel="stylesheet">
+    <link href="codemirror/addon/dialog/dialog.css" rel="stylesheet">
+    <link href="jquery.terminal/css/jquery.terminal.css" rel="stylesheet"/>
+    <style>
+        body, #layout {
+            margin: 0;
+            padding: 0;
+        }
+        #layout {
+            left: 0;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            position: absolute;
+        }
+        .CodeMirror {
+            width: 100%;
+            height: 100%;
+            border: 1px solid lightgray;
+        }
+        .terminal, .console {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        .terminal {
+            background-color: black;
+        }
+        .debug {
+            background-color: #FFFF66;
+        }
+        .breakpoints {
+            width: 12px;
+        }
+        .stack_frame {
+            font-weight: bold;
+            background-color: #ABFFD5;
+        }
+        .tooltip {
+            background-color: infobackground;
+            border: 1px solid black;
+            color: infotext;
+            font-family: monospace;
+            font-size: 10pt;
+            overflow: hidden;
+            padding: 2px 5px;
+            position: fixed;
+            z-index: 9999;
+            max-width: 600px;
+            transition: opacity .4s;
+            -moz-transition: opacity .4s;
+            -webkit-transition: opacity .4s;
+            -o-transition: opacity .4s;
+            -ms-transition: opacity .4s;
+        }
+    </style>
+    <script src="requirejs/require.js"></script>
+    <script>
+    require.config({
+        paths: {
+            jquery: 'jquery/dist/jquery.min',
+            w2ui: 'w2ui/dist/w2ui.min',
+            io: 'socket.io-client/socket.io',
+            jsdiff: 'jsdiff/diff.min',
+            'jquery.terminal': 'jquery.terminal/js/jquery.terminal-min',
+        },
+        packages: [{name: 'codemirror', location: 'codemirror', main: 'lib/codemirror'}],
+        shim: {
+            w2ui: {deps: ['jquery']},
+            'jquery.terminal': {deps: ['jquery']},
+        },
+    });
+    var modules = ['jquery', 'codemirror', 'io', 'jsdiff', 'term', 'w2ui', 'jquery.terminal',
+        'codemirror/mode/jade/jade', 'codemirror/addon/dialog/dialog',
+        'codemirror/addon/search/jump-to-line', 'codemirror/addon/search/search'];
+    require(modules, function($, CodeMirror, io, JsDiff){
+        var socket = io('/<%= namespace %>'), terminal, tooltip;
+        CodeMirror.commands.save = function(cm){
+            var tabs = w2ui.layout.get('main').tabs;
+            var data = {filename: tabs.active};
+            var tab = tabs.get(data.filename);
+            tab.dirty = false;
+            tab.doc = tab.cm.getValue();
+            tab.cm.markClean();
+            socket.emit('upload', $.extend(data, {data: tab.doc}));
+        };
+        CodeMirror.defaults.gutters = ['CodeMirror-linenumbers', 'breakpoints'];
+        function updateSettings(save){
+            var options = Object.keys(CodeMirror.defaults).reduce(function(o, key){
+                if (key in w2ui.settings.record)
+                    o[key] = w2ui.settings.record[key];
+                return o;
+            }, {});
+            $.extend(CodeMirror.defaults, options);
+            if (save)
+            {
+                w2ui.layout.get('main').tabs.tabs.forEach(function(tab){
+                    if (!tab.cm)
+                        return;
+                    Object.keys(options).forEach(function(key){
+                        tab.cm.setOption(key, options[key]); });
+                });
+                localStorage.settings = JSON.stringify(w2ui.settings.record);
+            }
+        }
+        function get_style(cls){
+            var el = $('<div>', {class: cls}).css({display: 'none'}).appendTo('body');
+            var css = el.css([].slice.call(arguments, 1));
+            el.remove();
+            return css;
+        }
+        function load_directory(path){
+            $.getJSON('files', {parent: path}, function(data){
+                var old = (path ? w2ui.files.get(path).nodes : w2ui.files.nodes).reduce(function(o, node){
+                    o[node.id] = true;
+                    return o;
+                }, {});
+                var nodes = [].concat(data.dirs.map(function(o, i){
+                    return $.extend(o, {img: 'icon-folder', dir: true, plus: true});
+                }), data.files.map(function(o){
+                    return $.extend(o, {img: 'icon-page'});
+                })).reduce(function(add, node){
+                    if (old[node.id])
+                        delete old[node.id];
+                    else
+                        add.push(node);
+                    return add;
+                }, []);
+                w2ui.files.remove.apply(w2ui.files, Object.keys(old));
+                nodes = (path ? w2ui.files.get(path).nodes : w2ui.files.nodes).concat(nodes).sort(function(a, b){
+                    if (a.dir===b.dir)
+                        return a.text.localeCompare(b.text);
+                    return a.dir ? -1 : 1;
+                });
+                if (!path)
+                {
+                    w2ui.files.remove.apply(w2ui.files, w2ui.files.nodes.map(function(node){
+                        return node.id; }));
+                    return w2ui.files.add(nodes);
+                }
+                w2ui.files.set(path, {nodes: nodes, loaded: true});
+                w2ui.files.expand(path);
+            });
+        }
+        function show_editor(tab){
+            w2ui.layout.content('main', '');
+            $(w2ui.layout.el('main')).append(tab.cm.getWrapperElement());
+            if (tab.cursor)
+                tab.cm.setCursor(tab.cursor);
+            tab.cm.focus();
+            return tab;
+        }
+        function activate_tab(filename)
+        {
+            var tabs = w2ui.layout.get('main').tabs;
+            var active = tabs.active;
+            if (active)
+                tabs.get(active).cursor = tabs.get(active).cm.getCursor();
+            var toolbar = w2ui.layout.get('main').toolbar;
+            return Promise.resolve(tabs.get(filename)).then(function(tab){
+                if (!tab)
+                {
+                    tabs.add({id: filename, caption: filename.split('/').pop(),
+                        closable: true, hint: filename});
+                    tab = tabs.get(filename);
+                }
+                if (tab.cm)
+                    return tab;
+                return new Promise(function(resolve, reject){
+                    $.get('download/'+filename, function(data, r, xhr){
+                        var cm = CodeMirror(w2ui.layout.el('main'), {
+                            value: data,
+                            mode: (xhr.getResponseHeader('Content-Type')||
+                                'text/plain').split(';')[0].trim(),
+                        });
+                        var timer;
+                        CodeMirror.on(cm.getWrapperElement(), 'mouseover', function(e){
+                            var node = e.target||e.srcElement;
+                            if (!node || w2ui.layout.get('right').hidden)
+                                return;
+                            if (timer)
+                                return;
+                            if (tooltip)
+                            {
+                                tooltip.remove();
+                                tooltip = null;
+                            }
+                            var text = node.innerText||node.textContent;
+                            var cancel = function(){
+                                if (timer)
+                                {
+                                    clearTimeout(timer);
+                                    timer = null;
+                                }
+                                CodeMirror.off(node, 'mouseout', cancel);
+                                CodeMirror.off(node, 'click', cancel);
+                            };
+                            CodeMirror.on(node, 'mouseout', cancel);
+                            CodeMirror.on(node, 'click', cancel);
+                            timer = setTimeout(function(){
+                                timer = null;
+                                cancel();
+                                if (!/^[a-zA-Z_$][0-9a-zA-Z_$]*$/.test(text))
+                                    return;
+                                if (tooltip)
+                                    tooltip.remove();
+                                tooltip = $('<pre>', {class: 'tooltip'}).data({
+                                    expression: text,
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                });
+                                var data = {evaluate: text};
+                                var sel = w2ui.frames.getSelection(true);
+                                if (sel.length)
+                                {
+                                    var rec = w2ui.frames.records[sel[0]];
+                                    data.frame =rec.frame ? rec.frame.frame :
+                                        rec.context.frame.frame;
+                                }
+                                else
+                                {
+                                    w2ui.frames.records.some(function(rec){
+                                        if (!rec.frame || rec.frame.filename!=filename)
+                                            return false;
+                                        data.frame = rec.frame.frame;
+                                        return true;
+                                    });
+                                }
+                                socket.emit('debug', data);
+                            }, 400);
+                        });
+                        CodeMirror.on(cm.getWrapperElement(), 'mouseout', function(){
+                            if (tooltip)
+                            {
+                                tooltip.remove();
+                                tooltip = null;
+                            }
+                        });
+                        cm.on('changes', function(){
+                            var dirty = !cm.isClean();
+                            if (dirty)
+                                toolbar.enable('save');
+                            else
+                                toolbar.disable('save');
+                            if (dirty==tab.dirty)
+                                return;
+                            tabs.set(filename, {text: tab.caption+(dirty ? '*' : ''),
+                                dirty: dirty});
+                        });
+                        cm.on('gutterClick', function(cm, line, gutter){
+                            if (gutter=='breakpoints')
+                            {
+                                var info = cm.lineInfo(line);
+                                var el = info.gutterMarkers && info.gutterMarkers[gutter];
+                                var breakpoints = JSON.parse(localStorage.breakpoints||'{}');
+                                breakpoints[filename] = breakpoints[filename] || {};
+                                if (el)
+                                    delete breakpoints[filename][line];
+                                else
+                                    breakpoints[filename][line] = true;
+                                localStorage.breakpoints = JSON.stringify(breakpoints);
+                                socket.emit('debug', {breakpoints: [{
+                                    breakpoint: el && $(el).data('breakpoint') || true,
+                                    filename: filename,
+                                    line: line,
+                                    clear: !!el,
+                                }]});
+                            }
+                        });
+                        $.extend(tab, {cm: cm, doc: data});
+                        resolve(tab);
+                    }, 'text').fail(function(xhr, status, err){ reject(err); });
+                });
+            }).then(function(tab){
+                tabs.select(filename);
+                if (active!=filename)
+                {
+                    w2ui.layout.content('main', '');
+                    $(w2ui.layout.el('main')).append(tab.cm.getWrapperElement());
+                    if (tab.cursor)
+                        tab.cm.setCursor(tab.cursor);
+                }
+                tab.cm.focus();
+                localStorage.tabs = JSON.stringify({
+                    files: tabs.tabs.filter(function(tab){
+                        return !tab.hidden;
+                    }).map(function(tab){
+                        return tab.id;
+                    }),
+                    active: filename,
+                });
+                toolbar.disable('run', 'stop', 'debug');
+                socket.emit('pm2', {filename: filename});
+                socket.emit('debug');
+                return tab;
+            });
+        }
+        $('#layout').w2layout({
+            name: 'layout',
+            panels: [
+                {type: 'left', size: '20%', resizable: true, style: 'background-color: #F5F6F7;', toolbar: {
+                    items: [
+                        {type: 'button', id: 'new', caption: 'New', icon: 'fa fa-file-o'},
+                        {type: 'button', id: 'delete', caption: 'Delete', icon: 'fa fa-trash', disabled: true},
+                    ],
+                    onClick: function(evt){
+                        if (evt.target=='new')
+                        {
+                            socket.emit('touch', {parent: w2ui.files.selected,
+                                filename: prompt('Enter Filename:')||''});
+                        }
+                        else if (evt.target=='delete')
+                        {
+                            w2ui.files.onMenuClick({target: w2ui.files.selected,
+                                menuItem: {id: 'delete'}});
+                        }
+                    },
+                }},
+                {type: 'right', size: '20%', resizable: true, style: 'background-color: #F5F6F7;', toolbar: {
+                    items: [
+                        {type: 'button', id: 'debug_run', icon: 'fa fa-play-circle', disabled: true, tooltip: 'Continue'},
+                        {type: 'break'},
+                        {type: 'button', id: 'debug_next', icon: 'fa fa-share', disabled: true, tooltip: 'Step over'},
+                        {type: 'button', id: 'debug_in', icon: 'fa fa-level-down', disabled: true, tooltip: 'Step into'},
+                        {type: 'button', id: 'debug_out', icon: 'fa fa-level-up', disabled: true, tooltip: 'Step out'},
+                        {type: 'break'},
+                        {type: 'button', id: 'stop', icon: 'fa fa-stop', tooltip: 'Stop'},
+                    ],
+                    onClick: function(evt){
+                        if (evt.target=='stop')
+                            return socket.emit('debug', {stop: true});
+                        this.disable('debug_run', 'debug_next', 'debug_in', 'debug_out');
+                        w2ui.layout.get('main').tabs.tabs.forEach(function(tab){
+                            if (tab.line)
+                            {
+                                tab.cm.removeLineClass(tab.line, 'background');
+                                delete tab.line;
+                            }
+                        });
+                        socket.emit('debug', {continue: true, stepaction:
+                            {debug_next: 'next', debug_in: 'in', debug_out: 'out'}[evt.target]});
+                    },
+                }, hidden: true},
+                {type: 'main', style: 'background-color: #F5F6F7; padding: 5px;', tabs: $().w2tabs({
+                    name: 'main_tabs',
+                    onClick: function(evt){
+                        activate_tab(evt.target);
+                    },
+                    onClose: function(evt){
+                        var tabs = this;
+                        if (evt.object.cm && !evt.object.cm.isClean())
+                        {
+                            w2confirm('Close '+evt.target+'?').yes(function(){
+                                evt.object.cm.markClean();
+                                tabs.animateClose(evt.target);
+                            });
+                            return evt.preventDefault();
+                        }
+                        var active = tabs.active;
+                        evt.onComplete = function(){
+                            tabs.hide(evt.target);
+                            if (active!=evt.target)
+                                return;
+                            var i = tabs.get(evt.target, true);
+                            if (i+1<tabs.tabs.length)
+                                tabs.click(tabs.tabs[i+1].id);
+                            else if (i)
+                                tabs.click(tabs.tabs[i-1].id);
+                            else
+                            {
+                                delete localStorage.tabs;
+                                w2ui.layout.content('main', '');
+                                w2ui.layout.get('main').toolbar.disable('save', 'run',
+                                    'stop', 'debug');
+                                tabs.active = null;
+                            }
+                        };
+                    },
+                }), show: {tabs: true}, toolbar: {
+                    items: [
+                        {type: 'button', id: 'save', text: 'Save', icon: 'fa fa-save', disabled: true},
+                        {type: 'break'},
+                        {type: 'button', id: 'run', text: 'Run', icon: 'fa fa-play-circle', disabled: true},
+                        {type: 'button', id: 'stop', text: 'Stop', icon: 'fa fa-stop', disabled: true},
+                        {type: 'break'},
+                        {type: 'button', id: 'debug', text: 'Debug', icon: 'fa fa-bug', disabled: true},
+                        {type: 'spacer'},
+                        {type: 'button', id: 'settings', icon: 'fa fa-gear'},
+                    ],
+                    onClick: function(evt){
+                        var tabs = w2ui.layout.get('main').tabs;
+                        var data = {filename: tabs.active};
+                        if (evt.target=='save')
+                            tabs.get(data.filename).cm.execCommand('save');
+                        else if (evt.target=='run' || evt.target=='stop' || evt.target=='debug')
+                        {
+                            this.disable('run');
+                            data[evt.target] = true;
+                            socket.emit('pm2', data);
+                        }
+                        else if (evt.target=='settings')
+                        {
+                            $().w2popup('open', {
+                                title: 'Settings',
+                                body: '<div id="form" style="width: 100%; height: 100%;"></div>',
+                                style: 'padding: 15px 0px 0px 0px',
+                                width: 500,
+                                height: 300,
+                                onToggle: function(evt){
+                                    $(w2ui.settings.box).hide();
+                                    evt.onComplete = function(){
+                                        $(w2ui.settings.box).show();
+                                        w2ui.settings.resize();
+                                    };
+                                },
+                                onOpen: function(evt){
+                                    evt.onComplete = function(){
+                                        $('#w2ui-popup #form').w2render('settings');
+                                    };
+                                },
+                                onClose: updateSettings,
+                            });
+                        }
+                    },
+                }},
+                {type: 'bottom', size: '30%', resizable: true, tabs: $().w2tabs({
+                    name: 'bottom_tabs',
+                    tabs: [
+                        {id: 'terminal', caption: 'Terminal', el: $('<pre>', {class: 'terminal'})},
+                        {id: 'console', caption: 'Console', el: $('<div>', {class: 'console'})},
+                    ],
+                    onClick: function(evt){
+                        w2ui.layout.content('bottom', '');
+                        $(w2ui.layout.el('bottom')).append(evt.object.el);
+                        evt.object.el.focus();
+                        if (evt.target=='terminal')
+                            return terminal.focus();
+                        if (evt.target=='console')
+                            return evt.object.terminal.focus(false);
+                    },
+                }), show: {tabs: true}},
+            ],
+            onResize: function(evt){
+                evt.onComplete = function(){
+                    if (!w2ui.layout || !terminal)
+                        return;
+                    var size = {
+                        cols: Math.max(0, Math.floor(($(w2ui.layout.el('bottom')).width()-10)/7)),
+                        rows: Math.max(0, Math.floor(($(w2ui.layout.el('bottom')).height()-10)/13)),
+                    };
+                    if (size.cols==terminal.cols && size.rows==terminal.rows)
+                        return;
+                    terminal.resize(size.cols, size.rows);
+                    socket.emit('terminal', size);
+                };
+            },
+        });
+        w2ui.layout.content('left', $().w2sidebar({
+            name: 'files',
+            menu: [{id: 'delete', text: 'Delete', icon: 'fa fa-trash'}],
+            onClick: function(evt){
+                var tree = this;
+                if (tree.selected && tree.selected!==evt.target)
+                    tree.refresh(tree.selected);
+                if (tree.selected===evt.target && Math.abs(Date.now()-evt.object.last_click-1000)<=500)
+                {
+                    evt.onComplete = function(){
+                        var div = $(document.getElementById('node_'+evt.target)).find('div.w2ui-node-caption');
+                        var input = $('<input>', {type: 'text'});
+                        $('<form>').append(input).appendTo(div.empty()).submit(function(){
+                            socket.emit('rename', {filename: evt.target, name: input.val()});
+                            return false;
+                        });
+                        input.focus().val(evt.target);
+                    };
+                }
+                evt.object.last_click = Date.now();
+                w2ui.layout.get('left').toolbar.enable('delete');
+            },
+            onDblClick: function(evt){
+                w2ui.files.refresh(evt.target);
+                if (evt.object.dir)
+                {
+                    if (evt.object.expanded)
+                        return;
+                    evt.preventDefault();
+                    return load_directory(evt.target);
+                }
+                activate_tab(evt.target);
+            },
+            onExpand: function(evt){
+                if (evt.object.loaded)
+                    return;
+                evt.preventDefault();
+                load_directory(evt.target);
+            },
+            onMenuClick: function(evt){
+                switch(evt.menuItem.id)
+                {
+                case 'delete':
+                    w2confirm('Delete '+evt.target+'?').yes(function(){
+                        socket.emit('delete', {filename: evt.target});
+                    });
+                    break;
+                }
+            },
+            onRefresh: function(evt){
+                var tree = this;
+                evt.onComplete = function(){
+                    var toolbar = w2ui.layout.get('left').toolbar;
+                    toolbar[tree.selected ? 'enable' : 'disable'].call(toolbar, 'delete');
+                };
+            },
+        }));
+        w2ui.layout.content('right', $().w2grid({
+            name: 'frames',
+            multiSelect: false,
+            columns: [
+                {field: 'name', size: '40%'},
+                {field: 'value', size: '100%'},
+            ],
+            onDblClick: function(evt){
+                var frame = this.get(evt.recid).frame;
+                if (!frame)
+                    return;
+                activate_tab(frame.filename).then(function(tab){
+                    tab.cm.setCursor({line: frame.line}); });
+            },
+        }));
+        $().w2form({
+            name: 'settings',
+            style: 'border: 0px; background-color: transparent;',
+            fields: [
+                {name: 'lineNumbers', type: 'checkbox', html: {caption: 'Show line number'}},
+                {name: 'indentUnit', type: 'int', html: {caption: 'Indentation'}},
+                {name: 'smartIndent', type: 'checkbox', html: {caption: 'Smart indentation'}},
+                {name: 'tabSize', type: 'int', html: {caption: 'Tab size'}},
+                {name: 'indentWithTabs', type: 'checkbox', html: {caption: 'Indent with tabs'}},
+                {name: 'electricChars', type: 'checkbox', html: {caption: 'Re-indent on type'}},
+                {name: 'lineWrapping', type: 'checkbox', html: {caption: 'Line wrapping'}},
+            ],
+            record: $.extend({
+                lineNumbers: false,
+                indentUnit: 4,
+                smartIndent: true,
+                tabSize: 4,
+                indentWithTabs: false,
+                electricChars: true,
+                lineWrapping: false,
+            }, JSON.parse(localStorage.settings||'{}')),
+        });
+        socket.on('watch', function(data){
+            var tab = w2ui.layout.get('main').tabs.get(data.filename);
+            if (tab)
+            {
+                if (data.event=='delete')
+                {
+                    w2confirm('Close '+data.filename+'?').yes(function(){
+                        w2ui.layout.get('main').tabs.animateClose(tab.id); });
+                }
+                else if (tab.cm)
+                {
+                    $.get('download/'+data.filename, function(data){
+                        if (tab.cm.isClean())
+                        {
+                            tab.cm.setValue(data);
+                            w2ui.layout.get('main').toolbar.disable('save');
+                            tab.cm.markClean();
+                            return w2ui.layout.get('main').tabs.set(tab.id, {dirty: false, text: tab.caption});
+                        }
+                        var patch = JsDiff.structuredPatch(tab.id, tab.id, tab.doc,
+                            tab.cm.getValue(), '', '');
+                        tab.cm.markClean();
+                        tab.cm.setValue(data);
+                        tab.cm.setValue(JsDiff.applyPatch(data, patch) || data);
+                        $.extend(tab, {doc: data});
+                        w2ui.layout.get('main').toolbar.enable('save');
+                    }, 'text');
+                }
+            }
+            var dir = data.filename.split('/').slice(0, -1).join('/');
+            if (!dir)
+                return load_directory();
+            var node = w2ui.files.get(dir);
+            if (node && node.loaded)
+                return load_directory(dir);
+        }).on('pm2', function(data){
+            if (w2ui.layout.get('main').tabs.active!==data.filename)
+                return;
+            if (data.stdout!==undefined || data.stderr!==undefined)
+                return;
+            var toolbar = w2ui.layout.get('main').toolbar;
+            toolbar.disable('run', 'stop', 'debug');
+            if (w2ui.layout.get('right').hidden)
+            {
+                toolbar.enable(data.running || data.debug ? 'stop' : 'run');
+                if (!data.running && !data.debug)
+                    toolbar.enable('debug');
+            }
+        }).on('debug', function(data){
+            var tabs = w2ui.layout.get('main').tabs;
+            var toolbar = w2ui.layout.get('right').toolbar;
+            if (data.breakpoints && !w2ui.layout.get('right').hidden)
+            {
+                var breakpoints = data.breakpoints.reduce(function(o, bp){
+                    o[bp.filename] = o[bp.filename] || [];
+                    o[bp.filename].push(bp);
+                    return o;
+                }, {});
+                localStorage.breakpoints = JSON.stringify(data.breakpoints.reduce(function(o, bp){
+                    o[bp.filename] = o[bp.filename] || {};
+                    o[bp.filename][bp.line] = true;
+                    return o;
+                }, {}));
+                tabs.tabs.forEach(function(tab){
+                    if (!tab.cm)
+                        return;
+                    tab.cm.clearGutter('breakpoints');
+                    if (!breakpoints[tab.id])
+                        return;
+                    breakpoints[tab.id].forEach(function(bp){
+                        tab.cm.setGutterMarker(bp.line, 'breakpoints',
+                            $('<span>').text('︎◆').data(bp)[0]);
+                    });
+                });
+            }
+            else
+            {
+                var breakpoints = JSON.parse(localStorage.breakpoints||'{}');
+                tabs.tabs.forEach(function(tab){
+                    if (!tab.cm)
+                        return;
+                    tab.cm.clearGutter('breakpoints');
+                    if (!breakpoints[tab.id])
+                        return;
+                    Object.keys(breakpoints[tab.id]).forEach(function(line){
+                        tab.cm.setGutterMarker(+line, 'breakpoints',
+                            $('<span>').text('︎◆').data({line: line})[0]);
+                    });
+                });
+            }
+            if (data.break)
+            {
+                if (w2ui.layout.get('right').hidden)
+                {
+                    w2ui.layout.show('right');
+                    var breakpoints = JSON.parse(localStorage.breakpoints||'{}');
+                    breakpoints = Object.keys(breakpoints).reduce(function(o, filename){
+                        Object.keys(breakpoints[filename]).forEach(function(line){
+                            o.push({breakpoint: true, filename: filename, line: line});
+                        });
+                        return o;
+                    }, []);
+                    socket.emit('debug', {breakpoints: breakpoints});
+                }
+                w2ui.frames.clear(true);
+                w2ui.frames.add(data.break.reduce(function(items, frame){
+                    var style = get_style('stack_frame', 'background-color',
+                        'font-weight');
+                    items.push({
+                        recid: frame.frame,
+                        name: frame.frame,
+                        value: frame.filename+':'+(frame.line+1),
+                        style: Object.keys(style).map(function(key){
+                            return key+':'+style[key]+';'; }).join(''),
+                        frame: frame,
+                    });
+                    Object.keys(frame.locals).sort().forEach(function(name){
+                        items.push({
+                            recid: frame.frame+':'+name,
+                            name: name,
+                            value: frame.locals[name].text,
+                            context: $.extend({frame: frame}, frame.locals[name]),
+                        });
+                    });
+                    return items;
+                }, []));
+                return activate_tab(data.break[0].filename).then(function(tab){
+                    toolbar.enable('debug_run', 'debug_next', 'debug_in', 'debug_out');
+                    tab.cm.setCursor({line: data.break[0].line});
+                    if (tab.line)
+                        tab.cm.removeLineClass(tab.line, 'background');
+                    tab.line = tab.cm.addLineClass(data.break[0].line, 'background', 'debug');
+                });
+            }
+            if (data.evaluate)
+            {
+                if (data.console)
+                {
+                    return w2ui.layout.get('bottom').tabs.get('console').terminal
+                        .echo(data.response);
+                }
+                if (!tooltip || tooltip.data('expression')!=data.evaluate)
+                    return;
+                tooltip.text(data.response).appendTo('body');
+                return tooltip.css({left: (tooltip.data('x')+5)+'px',
+                    top: Math.max(0, tooltip.data('y')-tooltip.height())+'px'});
+            }
+            w2ui.layout.get('main').tabs.tabs.forEach(function(tab){
+                if (tab.line)
+                {
+                    tab.cm.removeLineClass(tab.line, 'background');
+                    delete tab.line;
+                }
+            });
+            w2ui.layout.hide('right');
+            if (tabs.active)
+                socket.emit('pm2', {filename: tabs.active});
+
+        });
+        terminal = new Terminal({
+            useFocus: true,
+            screenKeys: false,
+            useStyle: true,
+            cols: Math.max(0, Math.floor(($(w2ui.layout.el('bottom')).width()-10)/7)),
+            rows: Math.max(0, Math.floor(($(w2ui.layout.el('bottom')).height()-10)/13)),
+        });
+        terminal.on('data', function(data){ socket.emit('terminal', data); });
+        terminal.open(w2ui.layout.get('bottom').tabs.get('terminal').el[0]);
+        socket.on('connect', function(){
+            socket.emit('terminal', {cols: terminal.cols, rows: terminal.rows}); });
+        socket.on('terminal', function(data){ terminal.write(data); });
+        w2ui.layout.get('bottom').tabs.get('console').terminal = w2ui.layout.get('bottom')
+            .tabs.get('console').el.terminal(function(cmd, term){
+                var data = {evaluate: cmd, console: true};
+                var sel = w2ui.frames.getSelection(true);
+                if (sel.length)
+                {
+                    var rec = w2ui.frames.records[sel[0]];
+                    data.frame =rec.frame ? rec.frame.frame :
+                        rec.context.frame.frame;
+                }
+                socket.emit('debug', data);
+            }, {greetings: false});
+        (function(){
+            updateSettings();
+            var tabs = w2ui.layout.get('main').tabs;
+            var files = JSON.parse(localStorage.tabs||'{}');
+            (files.files||[]).forEach(function(filename){
+                tabs.add({id: filename, caption: filename.split('/').pop(),
+                    closable: true, hint: filename});
+            });
+            if (files.active)
+                tabs.click(files.active);
+            w2ui.layout.get('bottom').tabs.click('terminal');
+            load_directory();
+        })();
+    });
+    </script>
+</head>
+<body>
+    <div id="layout"></div>
+</body>
+</html>
